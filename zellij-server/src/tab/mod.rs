@@ -163,6 +163,13 @@ pub(crate) struct Tab {
     tiled_panes: TiledPanes,
     floating_panes: FloatingPanes,
     suppressed_panes: SuppressedPanes,
+    // When a "solo floating" plugin (e.g. the session-manager launched with
+    // `solo_floating true`) is opened, we suppress the tab's other floating panes so it
+    // appears alone, and record them here keyed by the solo plugin's pane id. When that
+    // solo pane closes we restore them (see `new_floating_pane` and `close_pane`). Doing
+    // the suppression on the host BEFORE the pane is rendered avoids a visual flash where
+    // the sibling floating panes (e.g. a Ctrl+f scratch pane) briefly appear.
+    solo_floating_suppressed_panes: HashMap<PaneId, Vec<PaneId>>,
     max_panes: Option<usize>,
     viewport: Rc<RefCell<Viewport>>, // includes all non-UI panes
     display_area: Rc<RefCell<Size>>, // includes all panes (including eg. the status bar and tab bar in the default layout)
@@ -822,6 +829,7 @@ impl Tab {
             tiled_panes,
             floating_panes,
             suppressed_panes: HashMap::new(),
+            solo_floating_suppressed_panes: HashMap::new(),
             name: name.clone(),
             prev_name: name,
             size: initial_size,
@@ -1809,6 +1817,34 @@ impl Tab {
         blocking_notification: Option<NotificationEnd>,
     ) -> Result<()> {
         let err_context = || format!("failed to create new pane with id {pid:?}");
+        // A "solo floating" plugin (e.g. session-manager launched with `solo_floating true`)
+        // wants to appear ALONE in the floating layer. Suppress any sibling floating panes
+        // now — synchronously, before this pane is added and the tab is rendered — so the
+        // siblings (e.g. a hidden/visible Ctrl+f scratch pane) never flash on screen during
+        // launch. We record what we suppressed, keyed by this pane's id, and restore them
+        // when this solo pane closes (see `close_pane`). The plugin itself still drives when
+        // it becomes visible (via `show_self`) and when it dismisses (closing itself).
+        let is_solo_floating = invoked_with
+            .as_ref()
+            .and_then(|run| run.get_run_plugin())
+            .map(|run_plugin| {
+                run_plugin
+                    .configuration
+                    .inner()
+                    .get("solo_floating")
+                    .map(|value| value == "true")
+                    .unwrap_or(false)
+            })
+            .unwrap_or(false);
+        if is_solo_floating {
+            let siblings: Vec<PaneId> = self.floating_panes.pane_ids().copied().collect();
+            for sibling in &siblings {
+                self.suppress_pane(*sibling, None);
+            }
+            if !siblings.is_empty() {
+                self.solo_floating_suppressed_panes.insert(pid, siblings);
+            }
+        }
         if should_focus_pane {
             self.show_floating_panes();
         }
@@ -4121,6 +4157,17 @@ impl Tab {
             if let Some(mut closed_pane) = closed_pane {
                 // in case we need to update on Drop
                 closed_pane.update_exit_status(exit_status);
+            }
+        }
+        // If the pane that just closed was a "solo floating" plugin (see `new_floating_pane`),
+        // restore the sibling floating panes we suppressed when it opened. They are re-added
+        // to the floating layer without forcing it visible, so the user returns to a clean
+        // state and can summon them again with Ctrl+f.
+        if let Some(suppressed_siblings) = self.solo_floating_suppressed_panes.remove(&id) {
+            for sibling in suppressed_siblings {
+                if self.suppressed_panes.contains_key(&sibling) {
+                    self.unsuppress_pane(sibling, true);
+                }
             }
         }
         let _ = self.senders.send_to_plugin(PluginInstruction::Update(vec![(

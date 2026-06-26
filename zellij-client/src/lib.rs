@@ -155,7 +155,7 @@ use zellij_utils::{
     data::{ClientId, ConnectToSession, KeyWithModifier, LayoutInfo, LayoutMetadata},
     envs,
     errors::{ClientContext, ContextType, ErrorInstruction},
-    input::{cli_assets::CliAssets, config::Config, options::Options},
+    input::{actions::Action, cli_assets::CliAssets, config::Config, options::Options},
     ipc::{ClientToServerMsg, ExitReason, ResizeCause, ServerToClientMsg},
     pane_size::Size,
     vendored::termwiz::input::InputEvent,
@@ -954,6 +954,22 @@ pub fn start_client(
 
     os_input.connect_to_server(&*ipc_pipe);
     os_input.send_to_server(first_msg);
+
+    if is_a_reconnect {
+        // We just reconnected as part of a SESSION SWITCH (e.g. selecting another session in
+        // the session-manager). Hide the target session's floating panes so the switch lands
+        // on a clean tiled view instead of resurfacing whatever floating panes (e.g. a Ctrl+f
+        // scratch pane) happened to be visible there. This is gated on `is_a_reconnect`, which
+        // is only set when reconnecting from a switch — a normal `zellij attach` leaves the
+        // session's floating-pane visibility exactly as it was. `HideFloatingPanes` is
+        // idempotent (a no-op when nothing is floating), so this is safe to send on switch.
+        os_input.send_to_server(ClientToServerMsg::Action {
+            action: Action::HideFloatingPanes { tab_id: None },
+            terminal_id: None,
+            client_id: None,
+            is_cli_client: false,
+        });
+    }
 
     let mut command_is_executing = CommandIsExecuting::new();
 

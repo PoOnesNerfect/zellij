@@ -56,6 +56,32 @@ pub(crate) struct State {
     current_session_last_saved_time: Option<u64>,
     is_visible: bool,
     refresh_timer_armed: bool,
+    // When `solo_floating` is set (via plugin config), the session-manager behaves like
+    // a modal: while open it SUPPRESSES (hides aside, keeps alive) any sibling floating
+    // panes in its tab so it appears alone, and on dismiss it restores them but leaves
+    // the floating layer hidden (a clean state; press Ctrl+f to summon the scratch
+    // again). It dismisses on Esc, on the Ctrl+q toggle, on a tab switch, and when the
+    // floating layer is hidden (e.g. the user pressed Ctrl+f) — the latter detected via
+    // TabUpdate's `are_floating_panes_visible`, since a hidden floating pane keeps
+    // `is_focused == true` and so can't be detected from PaneUpdate alone.
+    solo_floating: bool,
+    suppressed_floating_panes: Vec<PaneId>,
+    solo_initialized: bool,
+    solo_closing: bool,
+    // The tab position we live in (key into PaneManifest / matches TabInfo.position),
+    // recorded so we can read our own tab's `are_floating_panes_visible` from TabUpdate.
+    solo_tab_position: Option<usize>,
+    // Latched true once we've actually SEEN our floating layer become visible (a TabUpdate
+    // with `are_floating_panes_visible == true` for our tab). Only after that do we treat a
+    // hidden layer as the Ctrl+f dismiss signal. This avoids a spurious dismiss during
+    // launch: while the layer is still hidden a floating pane already reports
+    // `is_focused == true`, and the suppress step emits an interim `are_floating == false`
+    // TabUpdate that would otherwise look like a hide.
+    solo_layer_was_shown: bool,
+    // Used to implement Ctrl+q as a toggle via the `MessagePlugin` keybind + `pipe()`:
+    // the launch that opens us also delivers the first "toggle" pipe, which must be
+    // ignored; later "toggle" pipes (Ctrl+q while open) close us.
+    toggle_pending_launch: bool,
 }
 
 register_plugin!(State);
@@ -77,8 +103,16 @@ impl ZellijPlugin for State {
         if !self.is_multi_screen {
             self.active_screen = ActiveScreen::SingleScreen;
         }
+        self.solo_floating = configuration
+            .get("solo_floating")
+            .map(|v| v == "true")
+            .unwrap_or(false);
         self.single_screen_state.is_welcome_screen = self.is_welcome_screen;
         self.is_visible = true;
+        // The first "toggle" pipe we receive belongs to the launch that opened us, so
+        // it must NOT close us. Subsequent "toggle" pipes (Ctrl+q pressed again while
+        // we're open) close us. See `pipe()`.
+        self.toggle_pending_launch = true;
         subscribe(&[
             EventType::ModeUpdate,
             EventType::SessionUpdate,
@@ -86,8 +120,16 @@ impl ZellijPlugin for State {
             EventType::RunCommandResult,
             EventType::Timer,
             EventType::Visible,
+            EventType::PaneUpdate,
+            EventType::TabUpdate,
         ]);
         rename_plugin_pane(get_plugin_ids().plugin_id, "Session Manager");
+        if self.solo_floating && !self.is_welcome_screen {
+            // Hide the floating layer immediately so a previously-visible scratch pane
+            // doesn't linger/flash on screen while we set up. We reveal ourselves alone
+            // (with siblings suppressed) on the first PaneUpdate below.
+            let _ = hide_floating_panes(None);
+        }
         self.refresh_session_list();
         if !self.is_welcome_screen {
             self.arm_refresh_timer();
@@ -95,6 +137,23 @@ impl ZellijPlugin for State {
     }
 
     fn pipe(&mut self, pipe_message: PipeMessage) -> bool {
+        if pipe_message.name == "toggle" {
+            // Ctrl+q is bound to `MessagePlugin ... name="toggle"`, which launches us
+            // (if needed) and pipes this message. The launch itself delivers the first
+            // "toggle" (which we must ignore), so the user's NEXT Ctrl+q closes us.
+            if self.toggle_pending_launch {
+                self.toggle_pending_launch = false;
+                if !self.solo_floating {
+                    // Without solo handling, focus ourselves now (a pipe-launched plugin
+                    // isn't focused by default). With solo_floating, the first PaneUpdate
+                    // suppresses siblings and then focuses us (see update()).
+                    show_self(true);
+                }
+            } else {
+                self.dismiss();
+            }
+            return false;
+        }
         if pipe_message.name == "filepicker_result" {
             match (pipe_message.payload, pipe_message.args.get("request_id")) {
                 (Some(payload), Some(request_id)) => {
@@ -146,6 +205,34 @@ impl ZellijPlugin for State {
                         should_render = true;
                     }
                     self.arm_refresh_timer();
+                } else if !is_visible && was_visible {
+                    // The whole tab was switched away from. Dismiss cleanly so we don't
+                    // leave the scratch pane suppressed/stranded.
+                    self.dismiss();
+                }
+            },
+            Event::PaneUpdate(pane_manifest) => {
+                if self.handle_solo_pane_update(&pane_manifest) {
+                    should_render = true;
+                }
+            },
+            Event::TabUpdate(tabs) => {
+                // Drive the solo modal's "the floating layer was hidden" dismiss (e.g. the
+                // user pressed Ctrl+f). We can't see this from PaneUpdate because a hidden
+                // floating pane still reports `is_focused == true`, so we read our own
+                // tab's `are_floating_panes_visible`. We only act once we've LATCHED that
+                // the layer was actually shown, so interim `false`s during launch (before
+                // `show_self` takes effect) don't spuriously dismiss us.
+                if self.solo_floating && !self.is_welcome_screen && !self.solo_closing {
+                    if let Some(pos) = self.solo_tab_position {
+                        if let Some(tab) = tabs.iter().find(|t| t.position == pos) {
+                            if tab.are_floating_panes_visible {
+                                self.solo_layer_was_shown = true;
+                            } else if self.solo_layer_was_shown {
+                                self.dismiss();
+                            }
+                        }
+                    }
                 }
             },
             Event::ModeUpdate(mode_info) => {
@@ -663,7 +750,7 @@ impl State {
                         self.reset_selected_index();
                     } else if !self.is_welcome_screen {
                         self.reset_selected_index();
-                        close_self();
+                        self.dismiss();
                     }
                     should_render = true;
                 },
@@ -676,7 +763,7 @@ impl State {
                         self.renaming_session_name = None;
                         should_render = true;
                     } else if !self.is_welcome_screen {
-                        close_self();
+                        self.dismiss();
                     }
                 },
                 BareKey::Char('a') if key.has_modifiers(&[KeyModifier::Ctrl]) => {
@@ -738,7 +825,7 @@ impl State {
             },
             BareKey::Esc if key.has_no_modifiers() => {
                 if !self.is_welcome_screen {
-                    close_self();
+                    self.dismiss();
                 }
             },
             _ => {},
@@ -930,7 +1017,7 @@ impl State {
                         &self.resurrectable_sessions.all_resurrectable_sessions,
                     );
                 } else if !self.is_welcome_screen {
-                    close_self();
+                    self.dismiss();
                 }
                 should_render = true;
             },
@@ -939,7 +1026,7 @@ impl State {
                     self.single_screen_state.selected_index = None;
                     should_render = true;
                 } else if !self.is_welcome_screen {
-                    close_self();
+                    self.dismiss();
                 }
             },
             _ => {},
@@ -1094,7 +1181,7 @@ impl State {
                     // session so as not to leave garbage sessions behind
                     quit_zellij();
                 } else {
-                    hide_self();
+                    self.hide_self_cleanup();
                 }
             },
             ActiveScreen::ResurrectSession => {
@@ -1107,7 +1194,7 @@ impl State {
                         // session so as not to leave garbage sessions behind
                         quit_zellij();
                     } else {
-                        hide_self();
+                        self.hide_self_cleanup();
                     }
                 }
             },
@@ -1163,7 +1250,7 @@ impl State {
                             if self.is_welcome_screen {
                                 quit_zellij();
                             } else {
-                                hide_self();
+                                self.hide_self_cleanup();
                             }
                         } else {
                             // No navigation - use typed name
@@ -1194,7 +1281,7 @@ impl State {
                                     if self.is_welcome_screen {
                                         quit_zellij();
                                     } else {
-                                        hide_self();
+                                        self.hide_self_cleanup();
                                     }
                                 }
                                 return;
@@ -1205,7 +1292,7 @@ impl State {
                                 if self.is_welcome_screen {
                                     quit_zellij();
                                 } else {
-                                    hide_self();
+                                    self.hide_self_cleanup();
                                 }
                                 return;
                             }
@@ -1237,7 +1324,7 @@ impl State {
                         if self.is_welcome_screen {
                             quit_zellij();
                         } else {
-                            hide_self();
+                            self.hide_self_cleanup();
                         }
                     },
                 }
@@ -1267,6 +1354,78 @@ impl State {
             set_timeout(1.0);
             self.refresh_timer_armed = true;
         }
+    }
+
+    // Dismiss the manager when switching to another session: restore the suppressed
+    // scratch pane(s) and close ourselves so we never linger in a hidden state.
+    fn hide_self_cleanup(&mut self) {
+        self.dismiss();
+    }
+
+    // Drives the `solo_floating` modal's first phase from PaneUpdate events: on the first
+    // update after launch, record which tab we live in, suppress sibling floating panes,
+    // then reveal ourselves alone (focused). The modal *dismiss* is driven separately from
+    // TabUpdate (see update()), because a hidden floating pane still reports
+    // `is_focused == true` and so can't be detected here.
+    fn handle_solo_pane_update(&mut self, pane_manifest: &PaneManifest) -> bool {
+        if !self.solo_floating || self.is_welcome_screen || self.solo_closing {
+            return false;
+        }
+        let my_plugin_id = get_plugin_ids().plugin_id;
+        // Find the tab we live in, so we only touch floating panes in our own tab.
+        let my_tab = pane_manifest.panes.iter().find_map(|(tab, panes)| {
+            if panes.iter().any(|p| p.is_plugin && p.id == my_plugin_id) {
+                Some(*tab)
+            } else {
+                None
+            }
+        });
+        let panes = match my_tab.and_then(|t| pane_manifest.panes.get(&t)) {
+            Some(panes) => panes,
+            None => return false,
+        };
+        // Remember our tab so the TabUpdate handler can read its floating-layer state.
+        self.solo_tab_position = my_tab;
+
+        if !self.solo_initialized {
+            for pane in panes {
+                let is_self = pane.is_plugin && pane.id == my_plugin_id;
+                if pane.is_floating && !pane.is_suppressed && !is_self {
+                    let pane_id = if pane.is_plugin {
+                        PaneId::Plugin(pane.id)
+                    } else {
+                        PaneId::Terminal(pane.id)
+                    };
+                    hide_pane_with_id(pane_id);
+                    self.suppressed_floating_panes.push(pane_id);
+                }
+            }
+            self.solo_initialized = true;
+            // Now that siblings are suppressed, reveal ourselves alone and focused.
+            show_self(true);
+            return false;
+        }
+        false
+    }
+
+    // Restore any suppressed scratch panes, then leave the floating layer hidden so the
+    // user returns to a clean state, and close ourselves. Guarded so it runs once.
+    fn dismiss(&mut self) {
+        if self.solo_closing {
+            return;
+        }
+        self.solo_closing = true;
+        let had_suppressed = !self.suppressed_floating_panes.is_empty();
+        for pane_id in std::mem::take(&mut self.suppressed_floating_panes) {
+            // Un-suppress the scratch pane(s) back into the floating layer...
+            show_pane_with_id(pane_id, true, false);
+        }
+        if had_suppressed || self.solo_initialized {
+            // ...but keep the floating layer hidden, so dismissing returns to a clean
+            // state (press Ctrl+f to summon the scratch pane again).
+            let _ = hide_floating_panes(None);
+        }
+        close_self();
     }
 
     fn refresh_session_list(&mut self) -> bool {

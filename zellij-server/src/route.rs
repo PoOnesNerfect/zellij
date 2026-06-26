@@ -2346,10 +2346,20 @@ pub(crate) fn route_thread_main(
                             if let Some((senders, default_shell, client_input_mode)) =
                                 session_data_assets
                             {
+                                // Only treat this as a CLI invocation (which echoes command
+                                // results — output, affected pane/tab ids, and crucially the
+                                // exit_status as a client `Exit`) when it actually came from a
+                                // `zellij action ...` CLI client. For interactive clients
+                                // (is_cli_client == false, e.g. keybindings, or the floating-pane
+                                // hide we send on a session switch) we pass `None` like the
+                                // keybind-from-stdin path above, so a completion's exit_status
+                                // can't terminate the interactive client.
+                                let route_cli_client_id =
+                                    if is_cli_client { Some(cli_client_id) } else { None };
                                 match route_action(
                                     action,
                                     client_id,
-                                    Some(cli_client_id),
+                                    route_cli_client_id,
                                     maybe_pane_id.map(|p| PaneId::Terminal(p)),
                                     senders,
                                     default_shell,
