@@ -61,6 +61,11 @@ impl<'a> StackedPanes<'a> {
             let destination_pane = panes
                 .get_mut(&destination_pane_id)
                 .with_context(err_context)?;
+            // the destination pane keeps its own logical position - we only borrow the
+            // source pane's geometry to transfer the expanded size, not its place in the
+            // layout (otherwise moving focus would reorder the stack, see #4084)
+            destination_pane_geom.logical_position =
+                destination_pane.position_and_size().logical_position;
             destination_pane.set_geom(destination_pane_geom);
         } else if destination_pane_stack_id.is_some() {
             // we're moving down to the highest pane in the stack, we need to expand it and shrink the
@@ -97,6 +102,11 @@ impl<'a> StackedPanes<'a> {
             let destination_pane = panes
                 .get_mut(&destination_pane_id)
                 .with_context(err_context)?;
+            // the destination pane keeps its own logical position - we only borrow the
+            // source pane's geometry to transfer the expanded size, not its place in the
+            // layout (otherwise moving focus would reorder the stack, see #4084)
+            destination_pane_geom.logical_position =
+                destination_pane.position_and_size().logical_position;
             destination_pane.set_geom(destination_pane_geom);
         } else if destination_pane_stack_id.is_some() {
             // we're moving up to the lowest pane in the stack, we need to expand it and shrink the

@@ -15026,3 +15026,212 @@ fn hidden_cursor_still_emits_cup_for_host_terminal_positioning() {
         "Show-cursor sequence must not be present when app has hidden the cursor"
     );
 }
+
+#[test]
+// Regression test for https://github.com/zellij-org/zellij/issues/4084
+// Moving focus within a stack used to copy the focused (source) pane's
+// logical_position onto the destination pane, creating duplicate logical
+// positions. When a new pane was then added and the swap layout was
+// re-applied, the duplicated logical positions scrambled the stack order.
+fn new_pane_from_middle_of_stack_does_not_reorder_stack() {
+    let size = Size {
+        cols: 121,
+        rows: 20,
+    };
+    let client_id = 1;
+    let swap_layouts = r#"
+        layout {
+            swap_tiled_layout name="editor" {
+                tab exact_panes=2 {
+                    pane split_direction="vertical" {
+                        pane size="60%"
+                        pane
+                    }
+                }
+                tab min_panes=3 {
+                    pane split_direction="vertical" {
+                        pane size="60%"
+                        pane stacked=true { children; }
+                    }
+                }
+            }
+        }
+    "#;
+    let layout = Layout::from_kdl(swap_layouts, Some("file_name.kdl".into()), None, None).unwrap();
+    let swap_tiled_layouts = layout.swap_tiled_layouts.clone();
+    let swap_floating_layouts = layout.swap_floating_layouts.clone();
+    let stacked_resize = true;
+    let mut tab = create_new_tab_with_swap_layouts(
+        size,
+        ModeInfo::default(),
+        (swap_tiled_layouts, swap_floating_layouts),
+        None,
+        true,
+        stacked_resize,
+    );
+
+    // ids of the panes that make up the stack (the right column), top to bottom
+    let stacked_pane_ids_top_to_bottom = |tab: &Tab| -> Vec<u32> {
+        let mut stacked: Vec<(usize, u32)> = tab
+            .tiled_panes
+            .get_panes()
+            .filter(|(_pid, p)| p.position_and_size().is_stacked())
+            .filter_map(|(pid, p)| match pid {
+                PaneId::Terminal(t) => Some((p.position_and_size().y, *t)),
+                _ => None,
+            })
+            .collect();
+        stacked.sort_by_key(|(y, _id)| *y);
+        stacked.into_iter().map(|(_y, id)| id).collect()
+    };
+    let stacked_logical_positions = |tab: &Tab| -> Vec<Option<usize>> {
+        tab.tiled_panes
+            .get_panes()
+            .filter(|(_pid, p)| p.position_and_size().is_stacked())
+            .map(|(_pid, p)| p.position_and_size().logical_position)
+            .collect()
+    };
+
+    // build a stack of 4 panes (2,3,4,5) in the right column (pane 1 stays on the left)
+    for new_id in [2u32, 3, 4, 5] {
+        tab.new_pane(
+            PaneId::Terminal(new_id),
+            None,
+            None,
+            false,
+            true,
+            NewPanePlacement::default(),
+            Some(client_id),
+            None,
+        )
+        .unwrap();
+    }
+    assert_eq!(
+        stacked_pane_ids_top_to_bottom(&tab),
+        vec![2, 3, 4, 5],
+        "stack should be ordered 2,3,4,5 after creation"
+    );
+
+    // traverse up into the middle of the stack (focus pane 3)
+    tab.move_focus_up(client_id).unwrap();
+    tab.move_focus_up(client_id).unwrap();
+
+    // moving focus within the stack must not create duplicate logical positions
+    let mut logical_positions = stacked_logical_positions(&tab);
+    logical_positions.sort();
+    let mut deduped = logical_positions.clone();
+    deduped.dedup();
+    assert_eq!(
+        logical_positions, deduped,
+        "moving focus within a stack must not create duplicate logical positions"
+    );
+
+    // create a new pane while focused on the middle of the stack
+    tab.new_pane(
+        PaneId::Terminal(6),
+        None,
+        None,
+        false,
+        true,
+        NewPanePlacement::default(),
+        Some(client_id),
+        None,
+    )
+    .unwrap();
+
+    // the stack order must be preserved with the new pane appended at the bottom
+    assert_eq!(
+        stacked_pane_ids_top_to_bottom(&tab),
+        vec![2, 3, 4, 5, 6],
+        "creating a new pane from the middle of the stack must not reorder it"
+    );
+}
+
+#[test]
+// Regression test for https://github.com/zellij-org/zellij/issues/4084
+// Closing a pane in the middle of a stack used to leave a "hole" in the panes'
+// logical positions. Re-applying the swap layout then matched the remaining
+// panes to the wrong layout slots, reordering the stack (the last pane jumped
+// up to fill the hole). Removing a pane must keep the logical positions
+// contiguous so the remaining panes keep their order.
+fn close_pane_in_middle_of_stack_does_not_reorder_stack() {
+    let size = Size {
+        cols: 121,
+        rows: 20,
+    };
+    let client_id = 1;
+    let swap_layouts = r#"
+        layout {
+            swap_tiled_layout name="editor" {
+                tab exact_panes=2 {
+                    pane split_direction="vertical" {
+                        pane size="60%"
+                        pane
+                    }
+                }
+                tab min_panes=3 {
+                    pane split_direction="vertical" {
+                        pane size="60%"
+                        pane stacked=true { children; }
+                    }
+                }
+            }
+        }
+    "#;
+    let layout = Layout::from_kdl(swap_layouts, Some("file_name.kdl".into()), None, None).unwrap();
+    let swap_tiled_layouts = layout.swap_tiled_layouts.clone();
+    let swap_floating_layouts = layout.swap_floating_layouts.clone();
+    let stacked_resize = true;
+    let mut tab = create_new_tab_with_swap_layouts(
+        size,
+        ModeInfo::default(),
+        (swap_tiled_layouts, swap_floating_layouts),
+        None,
+        true,
+        stacked_resize,
+    );
+
+    let stacked_pane_ids_top_to_bottom = |tab: &Tab| -> Vec<u32> {
+        let mut stacked: Vec<(usize, u32)> = tab
+            .tiled_panes
+            .get_panes()
+            .filter(|(_pid, p)| p.position_and_size().is_stacked())
+            .filter_map(|(pid, p)| match pid {
+                PaneId::Terminal(t) => Some((p.position_and_size().y, *t)),
+                _ => None,
+            })
+            .collect();
+        stacked.sort_by_key(|(y, _id)| *y);
+        stacked.into_iter().map(|(_y, id)| id).collect()
+    };
+
+    // build a stack of 4 panes (2,3,4,5) in the right column (pane 1 stays on the left)
+    for new_id in [2u32, 3, 4, 5] {
+        tab.new_pane(
+            PaneId::Terminal(new_id),
+            None,
+            None,
+            false,
+            true,
+            NewPanePlacement::default(),
+            Some(client_id),
+            None,
+        )
+        .unwrap();
+    }
+    assert_eq!(
+        stacked_pane_ids_top_to_bottom(&tab),
+        vec![2, 3, 4, 5],
+        "stack should be ordered 2,3,4,5 after creation"
+    );
+
+    // close a pane in the middle of the stack (pane 3)
+    tab.close_pane(PaneId::Terminal(3), false, None);
+
+    // the remaining panes must keep their relative order
+    assert_eq!(
+        stacked_pane_ids_top_to_bottom(&tab),
+        vec![2, 4, 5],
+        "closing a pane in the middle of the stack must not reorder the remaining panes"
+    );
+}

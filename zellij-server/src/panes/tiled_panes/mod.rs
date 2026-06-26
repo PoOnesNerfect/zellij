@@ -192,6 +192,20 @@ impl TiledPanes {
             pane.set_geom(position_and_size);
         }
     }
+    fn decrement_logical_positions_after(&mut self, removed_logical_position: usize) {
+        // when a pane is removed, the panes that came after it in the layout need to have
+        // their logical position shifted down by one so that the logical positions remain
+        // contiguous (and thus keep matching layout slots correctly on the next relayout)
+        for pane in self.panes.values_mut() {
+            let mut position_and_size = pane.position_and_size();
+            if let Some(logical_position) = position_and_size.logical_position {
+                if logical_position > removed_logical_position {
+                    position_and_size.logical_position = Some(logical_position - 1);
+                    pane.set_geom(position_and_size);
+                }
+            }
+        }
+    }
     pub fn insert_pane_without_relayout(
         &mut self,
         pane_id: PaneId,
@@ -2512,13 +2526,17 @@ impl TiledPanes {
         self.panes.remove(&pane_id)
     }
     pub fn remove_pane(&mut self, pane_id: PaneId) -> Option<Box<dyn Pane>> {
+        let removed_logical_position = self
+            .panes
+            .get(&pane_id)
+            .and_then(|p| p.position_and_size().logical_position);
         let mut pane_grid = TiledPaneGrid::new(
             &mut self.panes,
             &self.panes_to_hide,
             *self.display_area.borrow(),
             *self.viewport.borrow(),
         );
-        if pane_grid.fill_space_over_pane(pane_id) {
+        let closed_pane = if pane_grid.fill_space_over_pane(pane_id) {
             // successfully filled space over pane
             let closed_pane = self.panes.remove(&pane_id);
             self.move_clients_out_of_pane(pane_id);
@@ -2536,7 +2554,15 @@ impl TiledPanes {
                 self.active_panes.clear(&mut self.panes);
             }
             closed_pane
+        };
+        // keep the logical positions of the remaining panes contiguous so that re-applying
+        // a (swap) layout matches them to their layout slots in the correct order. Without
+        // this, closing a pane in the middle of a stack leaves a "hole" that gets filled by
+        // the wrong pane on the next relayout (see #4084)
+        if let Some(removed_logical_position) = removed_logical_position {
+            self.decrement_logical_positions_after(removed_logical_position);
         }
+        closed_pane
     }
     pub fn hold_pane(
         &mut self,
