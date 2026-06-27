@@ -3646,6 +3646,11 @@ pub fn osc_4_foreground_query() {
 
 #[test]
 pub fn osc_4_color_query() {
+    // A palette register that is already cached (warmed by the client's
+    // startup query batch and the double-dispatch refresh) is answered
+    // locally — no round-trip forward. This is the fast path that keeps a
+    // burst of palette probes from serializing behind the global in-flight
+    // forward slot.
     let mut color_codes = HashMap::new();
     color_codes.insert(222, String::from("rgb:ffff/d7d7/8787"));
     let mut vte_parser = vte::Parser::new();
@@ -3675,7 +3680,45 @@ pub fn osc_4_color_query() {
     for byte in content.as_bytes() {
         vte_parser.advance(&mut grid, *byte);
     }
-    // OSC 4;N;? is forwarded to the host for the real palette value.
+    // Cached register => answered locally, nothing forwarded.
+    assert!(grid.pending_forwarded_queries.is_empty());
+    let reply = String::from_utf8(grid.pending_messages_to_pty[0].clone()).unwrap();
+    assert_eq!(reply, "\u{1b}]4;222;rgb:ffff/d7d7/8787\u{1b}\\");
+}
+
+#[test]
+pub fn osc_4_color_query_uncached_is_forwarded() {
+    // A palette register that is NOT yet cached falls through to the host
+    // forward path (and the reply re-warms the cache via double-dispatch).
+    // This preserves the pre-cache-answer behaviour while cold.
+    let mut vte_parser = vte::Parser::new();
+    let sixel_image_store = Rc::new(RefCell::new(SixelImageStore::default()));
+    let terminal_emulator_color_codes = Rc::new(RefCell::new(HashMap::new()));
+    let debug = false;
+    let arrow_fonts = true;
+    let styled_underlines = true;
+    let osc8_hyperlinks = true;
+    let explicitly_disable_kitty_keyboard_protocol = false;
+    let mut grid = Grid::new(
+        51,
+        97,
+        Rc::new(RefCell::new(Palette::default())),
+        terminal_emulator_color_codes,
+        Rc::new(RefCell::new(LinkHandler::new())),
+        Rc::new(RefCell::new(None)),
+        sixel_image_store,
+        Style::default(),
+        debug,
+        arrow_fonts,
+        styled_underlines,
+        osc8_hyperlinks,
+        explicitly_disable_kitty_keyboard_protocol,
+    );
+    let content = "\u{1b}]4;222;?\u{1b}\\";
+    for byte in content.as_bytes() {
+        vte_parser.advance(&mut grid, *byte);
+    }
+    // Uncached register => forwarded to the host, nothing answered locally.
     assert!(grid.pending_messages_to_pty.is_empty());
     let forwarded_string: String = grid
         .pending_forwarded_queries

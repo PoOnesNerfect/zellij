@@ -9164,6 +9164,56 @@ fn host_theme_emits_again_on_mode_flip() {
 }
 
 #[test]
+fn host_theme_change_clears_palette_cache() {
+    // The grid answers palette-register queries locally from
+    // `terminal_emulator_color_codes`. A host theme switch changes the
+    // host's palette, so the mode update must clear that cache — otherwise
+    // the grid would keep serving the previous theme's colours. After
+    // clearing, the next query re-forwards to the host and re-warms.
+    let size = Size { cols: 80, rows: 20 };
+    let (mut screen, _capture) = create_new_screen_with_theme_capture(size);
+
+    screen.update_terminal_color_registers(vec![
+        (5, "rgb:0a0a/0b0b/0c0c".to_string()),
+        (200, "rgb:1111/2222/3333".to_string()),
+    ]);
+    assert!(
+        !screen.terminal_emulator_color_codes.borrow().is_empty(),
+        "precondition: palette cache populated"
+    );
+
+    screen
+        .update_host_terminal_theme_mode(zellij_utils::data::HostTerminalThemeMode::Dark)
+        .expect("theme update ok");
+
+    assert!(
+        screen.terminal_emulator_color_codes.borrow().is_empty(),
+        "a host theme change must clear the palette cache so stale colours are not served"
+    );
+}
+
+#[test]
+fn host_theme_dedupe_keeps_palette_cache() {
+    // A duplicate mode update is a no-op (the theme did not actually
+    // change), so it must NOT clear the palette cache.
+    let size = Size { cols: 80, rows: 20 };
+    let (mut screen, _capture) = create_new_screen_with_theme_capture(size);
+    screen
+        .update_host_terminal_theme_mode(zellij_utils::data::HostTerminalThemeMode::Light)
+        .expect("first ok");
+    screen.update_terminal_color_registers(vec![(7, "rgb:abab/cdcd/efef".to_string())]);
+
+    screen
+        .update_host_terminal_theme_mode(zellij_utils::data::HostTerminalThemeMode::Light)
+        .expect("dup ok");
+
+    assert!(
+        !screen.terminal_emulator_color_codes.borrow().is_empty(),
+        "a duplicate (no-op) theme update must not clear the palette cache"
+    );
+}
+
+#[test]
 fn color_palette_mode_query_short_circuits_to_dark_reply() {
     use crate::host_query::HostQuery;
     let size = Size { cols: 80, rows: 20 };

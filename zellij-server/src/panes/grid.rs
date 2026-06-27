@@ -3569,20 +3569,46 @@ impl Perform for Grid {
                         return;
                     } else if chunk.get(1).as_ref().and_then(|c| c.get(0)) == Some(&b'?') {
                         if let Some(index) = index {
-                            // Forward palette-register queries to the
-                            // host — apps want the actual host palette,
-                            // not Zellij's cached copy. (Zellij's cache
-                            // still auto-refreshes via double-dispatch
-                            // when the host's reply comes back.)
-                            self.pending_forwarded_queries.push(
-                                crate::host_query::HostQuery::PaletteRegister {
-                                    index,
-                                    terminator:
-                                        crate::host_query::OscTerminator::from_bell_terminated(
-                                            bell_terminated,
-                                        ),
-                                },
-                            );
+                            // Answer palette-register queries from Zellij's
+                            // cached copy of the host palette when that
+                            // register is warm. The cache is seeded by the
+                            // client's startup query batch (registers
+                            // 0..=255) and kept current by the double-dispatch
+                            // refresh on every forwarded reply; it is cleared
+                            // on a host theme change (see
+                            // `Screen::update_host_terminal_theme_mode`) so it
+                            // can never serve colours from a superseded theme.
+                            //
+                            // Answering locally avoids a per-register
+                            // round-trip to the host. Apps that probe many
+                            // registers in one burst (e.g. a TUI sampling the
+                            // whole palette to detect light vs dark) would
+                            // otherwise serialize behind the single global
+                            // in-flight forward slot, and the accumulated
+                            // latency can exceed the app's own reply deadline.
+                            // Registers missing from the cache fall through to
+                            // forwarding, which re-warms the cache for next
+                            // time — identical to the previous behaviour while
+                            // cold.
+                            let cached = self
+                                .terminal_emulator_color_codes
+                                .borrow()
+                                .get(&(index as usize))
+                                .cloned();
+                            if let Some(color) = cached {
+                                let reply = format!("\u{1b}]4;{};{}{}", index, color, terminator);
+                                self.pending_messages_to_pty.push(reply.into_bytes());
+                            } else {
+                                self.pending_forwarded_queries.push(
+                                    crate::host_query::HostQuery::PaletteRegister {
+                                        index,
+                                        terminator:
+                                            crate::host_query::OscTerminator::from_bell_terminated(
+                                                bell_terminated,
+                                            ),
+                                    },
+                                );
+                            }
                         }
                     }
                 }

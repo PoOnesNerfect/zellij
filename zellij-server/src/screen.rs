@@ -5109,6 +5109,18 @@ impl Screen {
         }
         self.host_terminal_theme_mode = Some(mode);
 
+        // A host theme switch changes the colours the host reports for
+        // every palette register. The grid answers palette-register
+        // queries locally from `terminal_emulator_color_codes` (see the
+        // `OSC 4` handler in `Grid::osc_dispatch`), so drop that cache here
+        // — otherwise it would keep serving the previous theme's colours.
+        // Clearing it forces the next palette query to re-forward to the
+        // host, which both returns the correct new colour and re-warms the
+        // cache via the usual double-dispatch refresh. The foreground /
+        // background caches are left untouched: those queries are always
+        // forwarded live, so they need no invalidation.
+        self.terminal_emulator_color_codes.borrow_mut().clear();
+
         // resolve target styling
         let resolved = match mode {
             HostTerminalThemeMode::Dark => self.host_theme_dark_styling,
